@@ -8,6 +8,9 @@ import type {
   ErrorResponse,
   Quote,
   Hold,
+  Itinerary,
+  ItinerarySearchResult,
+  CreateItineraryRequest,
 } from '../types';
 
 // Create axios instance with base configuration
@@ -198,6 +201,52 @@ export const releaseHold = async (holdId: string): Promise<Hold> => {
   const response = await api.post(`/holds/${holdId}/release`);
   assertNotProxyError(response.data);
   return response.data as Hold;
+};
+
+// ==================== Itinerary Endpoints ====================
+
+/**
+ * Search 1-3 leg itineraries for a departure date (YYYY-MM-DD)
+ */
+export const searchItineraries = async (
+  origin: string,
+  destination: string,
+  date: string
+): Promise<ItinerarySearchResult[]> => {
+  const response = await api.get<ItinerarySearchResult[]>('/itineraries/search', {
+    params: { origin, destination, date },
+  });
+  return response.data;
+};
+
+/**
+ * Hold every leg of an itinerary
+ */
+export const createItinerary = async (
+  data: CreateItineraryRequest
+): Promise<Itinerary | ErrorResponse> => {
+  const response = await api.post<Itinerary | ErrorResponse>('/itineraries', data);
+  return response.data;
+};
+
+/**
+ * Confirm all held legs of an itinerary
+ */
+export const confirmItinerary = async (
+  itineraryId: number
+): Promise<Itinerary | ErrorResponse> => {
+  const response = await api.post<Itinerary | ErrorResponse>(
+    `/itineraries/${itineraryId}/confirm`
+  );
+  return response.data;
+};
+
+/**
+ * Get all itineraries for a user
+ */
+export const getUserItineraries = async (userId: number): Promise<Itinerary[]> => {
+  const response = await api.get<Itinerary[]>(`/users/${userId}/itineraries`);
+  return response.data;
 };
 
 // ==================== Helper Functions ====================

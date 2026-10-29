@@ -1,7 +1,7 @@
 from enum import Enum
 
 from sqlalchemy import Column, ForeignKey, Integer, String
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
 
@@ -38,3 +38,30 @@ class Booking(Base):
     booking_time = Column(String, nullable=False)
     seat_class = Column(String, nullable=False, default='economy')  # economy/business/galaxium
     price_paid = Column(Integer, nullable=False)  # Actual price at booking time
+    # Nullable; added to existing DBs via ALTER TABLE in init_db()
+    itinerary_id = Column(Integer, ForeignKey('itineraries.itinerary_id'), nullable=True)
+
+class Itinerary(Base):
+    __tablename__ = 'itineraries'
+    itinerary_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.user_id'), nullable=False)
+    status = Column(String, nullable=False)  # held | confirmed | failed
+    created_at = Column(String, nullable=False)
+
+    legs = relationship(
+        'ItineraryLeg',
+        back_populates='itinerary',
+        order_by='ItineraryLeg.leg_order',
+    )
+
+class ItineraryLeg(Base):
+    __tablename__ = 'itinerary_legs'
+    leg_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    itinerary_id = Column(Integer, ForeignKey('itineraries.itinerary_id'), nullable=False)
+    flight_id = Column(Integer, ForeignKey('flights.flight_id'), nullable=False)
+    booking_id = Column(Integer, ForeignKey('bookings.booking_id'), nullable=True)
+    hold_id = Column(String, nullable=True)
+    leg_order = Column(Integer, nullable=False)
+
+    itinerary = relationship('Itinerary', back_populates='legs')
+    flight = relationship('Flight')

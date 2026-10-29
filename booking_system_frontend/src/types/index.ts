@@ -113,4 +113,36 @@ export interface StoredHold {
   reservedUntil: string;
 }
 
+// Multi-leg itinerary types
+
+export interface ItineraryLeg {
+  leg_id: number;
+  flight_id: number;
+  leg_order: number;
+  flight: Flight;
+  booking_id: number | null;
+  hold_id: string | null;
+}
+
+export interface Itinerary {
+  itinerary_id: number;
+  user_id: number;
+  status: 'held' | 'confirmed' | 'failed';
+  created_at: string;
+  legs: ItineraryLeg[];
+  total_price: number;
+}
+
+export interface ItinerarySearchResult {
+  legs: Flight[];
+  total_price: number;
+  total_duration_minutes: number;
+}
+
+export interface CreateItineraryRequest {
+  user_id: number;
+  name: string;
+  flight_ids: number[];
+}
+
 // Made with Bob
