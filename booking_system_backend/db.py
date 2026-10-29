@@ -1,6 +1,7 @@
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import sessionmaker
 
 from models import Base
@@ -24,7 +25,18 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
+    """Create all tables and add `bookings.itinerary_id` to pre-existing databases."""
     Base.metadata.create_all(bind=engine)
+    # create_all does not alter existing tables, so add the column manually.
+    # A duplicate-column error means the column already exists and is ignored.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE bookings ADD COLUMN itinerary_id INTEGER "
+                "REFERENCES itineraries(itinerary_id)"
+            ))
+    except (OperationalError, ProgrammingError):
+        pass
 
 def get_db():
     db = SessionLocal()

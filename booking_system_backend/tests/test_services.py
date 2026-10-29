@@ -1,11 +1,16 @@
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models import Booking, Flight, User
+from models import Booking, Flight, Itinerary, ItineraryLeg, User
 from schemas import ErrorResponse
-from services import booking, flight, user
+from services import booking, flight, itinerary, user
 
 
 class TestFlightService:
@@ -971,3 +976,235 @@ class TestFlightFiltering:
 
         results = flight.list_flights(db_session, min_price=10000000)
         assert len(results) == 0
+
+
+class TestItineraryService:
+    """Test itinerary service functions."""
+
+    @pytest.mark.asyncio
+    async def test_confirm_itinerary_partial_failure(self, db_session, monkeypatch):
+        """A failed second-leg confirm cancels leg 1's booking and releases leg 2's hold."""
+        db_session.add(User(user_id=1, name="Alice", email="alice@example.com"))
+        for flight_id, origin, destination in ((1, "Earth", "Mars"), (2, "Mars", "Jupiter")):
+            db_session.add(Flight(
+                flight_id=flight_id, origin=origin, destination=destination,
+                departure_time="2099-02-01 08:00", arrival_time="2099-02-01 16:00",
+                base_price=1000, economy_seats_available=5,
+                business_seats_available=3, galaxium_seats_available=1,
+            ))
+        db_session.add(Itinerary(
+            itinerary_id=1, user_id=1, status="held", created_at="2099-01-01T00:00:00+00:00"
+        ))
+        db_session.add_all([
+            ItineraryLeg(itinerary_id=1, flight_id=1, hold_id="H-001", leg_order=1),
+            ItineraryLeg(itinerary_id=1, flight_id=2, hold_id="H-002", leg_order=2),
+        ])
+        db_session.commit()
+
+        posted_urls = []
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, **kwargs):
+                posted_urls.append(url)
+                if url.endswith("/holds/H-002/confirm"):
+                    raise httpx.HTTPStatusError(
+                        "boom", request=MagicMock(), response=MagicMock(status_code=500)
+                    )
+                response = MagicMock()
+                response.raise_for_status.return_value = None
+                if url.endswith("/holds/H-001/confirm"):
+                    response.json.return_value = {
+                        "status": "CONFIRMED", "externalBookingReference": "99"
+                    }
+                else:
+                    response.json.return_value = {"status": "RELEASED"}
+                return response
+
+        cancelled = []
+        monkeypatch.setattr(itinerary.httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(
+            booking, "cancel_booking", lambda db, booking_id: cancelled.append(booking_id)
+        )
+
+        result = await itinerary.confirm_itinerary(db_session, 1)
+
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "CONFIRM_FAILED"
+        db_session.expire_all()
+        assert db_session.query(Itinerary).filter_by(itinerary_id=1).one().status == "failed"
+        assert cancelled == [99]
+        assert any(url.endswith("/holds/H-002/release") for url in posted_urls)
+        assert not any(url.endswith("/holds/H-001/release") for url in posted_urls)
+
+
+class TestItineraryCreateLimits:
+    """Tests for POST /itineraries business-limit controls (F-2 and F-4 from audit)."""
+
+    # ------------------------------------------------------------------
+    # Fix 1 — flight_ids list length (schema-level, tested via REST client)
+    # ------------------------------------------------------------------
+
+    def test_zero_flight_ids_rejected_422(self, client):
+        """An empty flight_ids list is rejected by Pydantic before hitting the service."""
+        resp = client.post(
+            "/itineraries",
+            json={"user_id": 1, "name": "Alice", "flight_ids": []},
+        )
+        assert resp.status_code == 422
+
+    def test_four_flight_ids_rejected_422(self, client):
+        """A list of 4 flight IDs exceeds max_length=3 and is rejected with 422."""
+        resp = client.post(
+            "/itineraries",
+            json={"user_id": 1, "name": "Alice", "flight_ids": [1, 2, 3, 4]},
+        )
+        assert resp.status_code == 422
+
+    def test_one_flight_id_passes_schema(self, client, db_session):
+        """A single flight_id satisfies min_length=1 and reaches the service layer."""
+        # Service will return USER_NOT_FOUND (409), proving schema validation passed.
+        resp = client.post(
+            "/itineraries",
+            json={"user_id": 999, "name": "Nobody", "flight_ids": [1]},
+        )
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["error_code"] == "USER_NOT_FOUND"
+
+    def test_three_flight_ids_passes_schema(self, client, db_session):
+        """Three flight_ids satisfies max_length=3 and reaches the service layer."""
+        resp = client.post(
+            "/itineraries",
+            json={"user_id": 999, "name": "Nobody", "flight_ids": [1, 2, 3]},
+        )
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["error_code"] == "USER_NOT_FOUND"
+
+    # ------------------------------------------------------------------
+    # Fix 2 — per-user hold cap (service-layer, tested directly)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_too_many_holds_returns_error(self, db_session, monkeypatch):
+        """User with 3 active held itineraries within the hold window is rejected."""
+        import services.itinerary as svc
+
+        db_session.add(User(user_id=10, name="Bob", email="bob@example.com"))
+        db_session.add(Flight(
+            flight_id=10, origin="Earth", destination="Mars",
+            departure_time="2099-06-01 10:00", arrival_time="2099-06-01 18:00",
+            base_price=500, economy_seats_available=10,
+            business_seats_available=3, galaxium_seats_available=1,
+        ))
+        db_session.commit()
+
+        # Insert 3 held itineraries all created "now" (well within the window).
+        now = datetime.now(tz=UTC).isoformat()
+        for _ in range(3):
+            db_session.add(Itinerary(user_id=10, status="held", created_at=now))
+        db_session.commit()
+
+        result = await svc.create_itinerary(db_session, 10, "Bob", [10])
+
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "TOO_MANY_HOLDS"
+
+    @pytest.mark.asyncio
+    async def test_expired_holds_do_not_count(self, db_session, monkeypatch):
+        """Held itineraries older than HOLD_DURATION_MINUTES are not counted."""
+        import services.itinerary as svc
+
+        db_session.add(User(user_id=11, name="Carol", email="carol@example.com"))
+        db_session.add(Flight(
+            flight_id=11, origin="Earth", destination="Venus",
+            departure_time="2099-06-02 10:00", arrival_time="2099-06-02 18:00",
+            base_price=500, economy_seats_available=10,
+            business_seats_available=3, galaxium_seats_available=1,
+        ))
+        db_session.commit()
+
+        # 3 itineraries created 20 minutes ago — beyond the default 15-minute window.
+        stale = (datetime.now(tz=UTC) - timedelta(minutes=20)).isoformat()
+        for _ in range(3):
+            db_session.add(Itinerary(user_id=11, status="held", created_at=stale))
+        db_session.commit()
+
+        # Patch httpx so the service doesn't try to reach the Java service.
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, **kwargs):
+                raise httpx.HTTPError("no java service in tests")
+
+        monkeypatch.setattr(svc.httpx, "AsyncClient", FakeClient)
+
+        result = await svc.create_itinerary(db_session, 11, "Carol", [11])
+
+        # Not rejected by the cap — reaches the Java call and fails with HOLD_FAILED.
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "HOLD_FAILED"
+
+    @pytest.mark.asyncio
+    async def test_too_many_holds_http_429(self, client, db_session):
+        """POST /itineraries returns 429 when the per-user hold cap is reached."""
+        db_session.add(User(user_id=20, name="Dave", email="dave@example.com"))
+        db_session.commit()
+
+        now = datetime.now(tz=UTC).isoformat()
+        for _ in range(3):
+            db_session.add(Itinerary(user_id=20, status="held", created_at=now))
+        db_session.commit()
+
+        resp = client.post(
+            "/itineraries",
+            json={"user_id": 20, "name": "Dave", "flight_ids": [1]},
+        )
+        assert resp.status_code == 429
+        assert resp.json()["detail"]["error_code"] == "TOO_MANY_HOLDS"
+
+    @pytest.mark.asyncio
+    async def test_confirmed_itineraries_do_not_count(self, db_session, monkeypatch):
+        """Only 'held' itineraries count toward the cap; confirmed ones do not."""
+        import services.itinerary as svc
+
+        db_session.add(User(user_id=12, name="Eve", email="eve@example.com"))
+        db_session.add(Flight(
+            flight_id=12, origin="Mars", destination="Jupiter",
+            departure_time="2099-06-03 10:00", arrival_time="2099-06-04 06:00",
+            base_price=800, economy_seats_available=10,
+            business_seats_available=3, galaxium_seats_available=1,
+        ))
+        db_session.commit()
+
+        now = datetime.now(tz=UTC).isoformat()
+        # 3 confirmed itineraries — these must NOT block a new hold.
+        for _ in range(3):
+            db_session.add(Itinerary(user_id=12, status="confirmed", created_at=now))
+        db_session.commit()
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, **kwargs):
+                raise httpx.HTTPError("no java service in tests")
+
+        monkeypatch.setattr(svc.httpx, "AsyncClient", FakeClient)
+
+        result = await svc.create_itinerary(db_session, 12, "Eve", [12])
+
+        # Cap not triggered — reaches Java call and fails with HOLD_FAILED.
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "HOLD_FAILED"

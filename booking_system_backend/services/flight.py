@@ -56,7 +56,10 @@ def list_flights(
     max_duration: int | None = None,
     min_seats_available: int | None = None,
     # Phase 3: Popular Routes from feature branch
-    route_category: str | None = None
+    route_category: str | None = None,
+    # Pagination (applied after filtering and sorting; None means no limit)
+    limit: int | None = None,
+    offset: int = 0
 ) -> list[FlightOut] | ErrorResponse:
     """List flights with optional filtering and sorting.
     
@@ -83,6 +86,8 @@ def list_flights(
         max_duration: Maximum flight duration in hours
         min_seats_available: Minimum total seats available
         route_category: Route category (inner_planets, outer_planets, moons)
+        limit: Maximum number of flights to return (None for all)
+        offset: Number of flights to skip after filtering and sorting
     
     Returns:
         List of FlightOut objects with computed prices for all seat classes
@@ -227,6 +232,32 @@ def list_flights(
             )
     
     # Return only FlightOut objects
-    return [flight_out for flight_out, _, _ in result]
+    flights_out = [flight_out for flight_out, _, _ in result]
+    end = None if limit is None else offset + limit
+    return flights_out[offset:end]
+
+def check_seat_availability(
+    db: Session, flight_id: int, seat_class: str, quantity: int
+) -> ErrorResponse | None:
+    """Check that a flight has at least `quantity` seats left in `seat_class`.
+
+    Returns None when enough seats are available, or an ErrorResponse with error_code
+    FLIGHT_NOT_FOUND or NO_SEATS_AVAILABLE otherwise.
+    """
+    found = db.query(Flight).filter(Flight.flight_id == flight_id).first()
+    if not found:
+        return ErrorResponse(
+            error="Flight not found",
+            error_code="FLIGHT_NOT_FOUND",
+            details=f"The specified flight_id {flight_id} does not exist in our system.",
+        )
+    available = getattr(found, f"{seat_class}_seats_available")
+    if available < quantity:
+        return ErrorResponse(
+            error=f"Not enough {seat_class} seats available",
+            error_code="NO_SEATS_AVAILABLE",
+            details=f"Requested {quantity} {seat_class} seats but only {available} are available.",
+        )
+    return None
 
 # Made with Bob
